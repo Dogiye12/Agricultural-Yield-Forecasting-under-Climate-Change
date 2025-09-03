@@ -1,0 +1,239 @@
+# file: agricultural_yield_forecasting_under_climate_change.py
+# Purpose: End-to-end ML demo (synthetic data >100 points)
+# Models: RandomForestRegressor + GradientBoostingRegressor
+# Outputs: dataset CSV, trained models, plots, and scenario analysis
+
+import os, math, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from pathlib import Path
+from dataclasses import dataclass
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+from joblib import dump
+
+# -----------------------------
+# 0) Config
+# -----------------------------
+np.random.seed(42)
+OUT = Path("outputs_yield")
+OUT.mkdir(parents=True, exist_ok=True)
+
+@dataclass
+class Config:
+    n_regions: int = 40
+    start_year: int = 2000
+    end_year: int = 2024  # inclusive
+    crop: str = "Maize"
+
+CFG = Config()
+
+# -----------------------------
+# 1) Synthetic data generation
+# -----------------------------
+def generate_dataset(cfg: Config) -> pd.DataFrame:
+    years = np.arange(cfg.start_year, cfg.end_year + 1)
+    nY = len(years)
+
+    # region meta
+    region_id = np.arange(cfg.n_regions)
+    lat = np.random.uniform(-25, 35, cfg.n_regions)
+    lon = np.random.uniform(-20, 45, cfg.n_regions)
+    elev = np.random.uniform(50, 1500, cfg.n_regions)  # m
+    soil_om = np.clip(np.random.normal(2.0, 0.6, cfg.n_regions), 0.5, 6.0)  # %
+    soil_cation = np.clip(np.random.normal(10, 3, cfg.n_regions), 2, 25)    # meq/100g
+    irrigation_share = np.clip(np.random.beta(2, 4, cfg.n_regions), 0, 1)   # fraction
+
+    records = []
+    for i in range(cfg.n_regions):
+        base_temp = np.random.uniform(20, 30) - 0.003*elev[i]  # cooler at elevation
+        base_prcp = np.random.uniform(450, 1200) + 0.05*elev[i]  # orographic boost
+        base_wind = np.random.uniform(1.5, 4.5)
+
+        # long-term trends (climate change stylized)
+        temp_trend = 0.03  # °C/year
+        prcp_trend = np.random.normal(-0.4, 0.25)  # mm/year (slight drying on avg)
+
+        for t, yr in enumerate(years):
+            # Climate
+            temp = base_temp + temp_trend * (yr - years[0]) + np.random.normal(0, 1.2)
+            prcp = max(5.0, base_prcp + prcp_trend * (yr - years[0]) +
+                       np.random.normal(0, 90))
+            wind = max(0.1, base_wind + np.random.normal(0, 0.6))
+            heatwave_days = max(0, np.random.normal(5 + 0.6*(temp-28), 3))
+            vpd = np.clip(0.5 + 0.06*(temp-25) - 0.0005*prcp + np.random.normal(0, 0.1), 0.2, 3.0)
+
+            # CO2 rising over time (ppm)
+            co2 = 370 + 2.2 * (yr - 2000) + np.random.normal(0, 1.5)
+
+            # Management
+            fert = np.clip(np.random.normal(120, 35), 0, 250)  # kg/ha
+            irr = np.random.binomial(1, irrigation_share[i])   # 0/1 irrigation access
+            variety = np.clip(np.random.normal(0.0 + 0.02*(yr-2000), 0.2), -0.2, 1.0)  # tech progress
+
+            # Remote-sensing proxies (seasonal composites)
+            ndvi = np.clip(0.2 + 0.0005*prcp - 0.02*(temp-28) + 0.1*irr
+                            + 0.03*variety + np.random.normal(0, 0.05), 0.05, 0.9)
+            evi  = np.clip(0.15 + 0.00045*prcp - 0.018*(temp-28) + 0.08*irr
+                            + 0.03*variety + np.random.normal(0, 0.05), 0.05, 0.8)
+            lst  = temp + np.random.normal(0, 0.8)  # land surface temp
+            sm   = np.clip(0.10 + 0.0003*prcp - 0.03*vpd + 0.05*irr + np.random.normal(0, 0.03), 0.02, 0.45)
+
+            # Yield generation (t/ha) with interactions & diminishing returns
+            heat_penalty = 0.07 * np.maximum(0, temp - 28) ** 1.4 + 0.003*heatwave_days**1.2
+            water_benefit = 0.0045*prcp - 0.0000015*prcp**2  # quadratic rainfall response
+            fert_resp = 0.025*fert - 0.00009*fert**2         # diminishing return
+            co2_fert = 0.0012 * (co2 - 370)                  # small positive fertilization
+            sm_interact = 0.25*sm - 0.06*(vpd* (1-sm))       # moisture vs. dryness
+            remote = 2.0*ndvi + 0.8*evi - 0.03*(lst-28)
+
+            yield_tpha = (
+                2.5 + water_benefit - heat_penalty + fert_resp + co2_fert
+                + 0.12*soil_om[i] + 0.02*soil_cation[i] + 0.5*irr + 0.6*variety
+                + sm_interact + remote + np.random.normal(0, 0.35)
+            )
+            yield_tpha = max(0.2, yield_tpha)  # avoid negatives
+
+            records.append({
+                "region": i, "lat": lat[i], "lon": lon[i], "elev_m": elev[i],
+                "year": yr, "crop": cfg.crop,
+                "temp_c": temp, "precip_mm": prcp, "wind_ms": wind,
+                "vpd_kpa": vpd, "heatwave_days": heatwave_days, "co2_ppm": co2,
+                "soil_om_pct": soil_om[i], "soil_cation_meq": soil_cation[i],
+                "fert_kg_ha": fert, "irrigated": irr, "variety_score": variety,
+                "ndvi": ndvi, "evi": evi, "lst_c": lst, "soil_moisture": sm,
+                "yield_t_ha": yield_tpha
+            })
+
+    df = pd.DataFrame.from_records(records)
+    return df
+
+df = generate_dataset(CFG)
+assert len(df) > 100
+
+csv_path = OUT / "agri_yield_synthetic.csv"
+df.to_csv(csv_path, index=False)
+print(f"Saved dataset: {csv_path} (rows={len(df)})")
+
+# -----------------------------
+# 2) Train/test split (time-aware)
+# -----------------------------
+# hold out last 3 years for testing
+TEST_YEARS = list(range(CFG.end_year-2, CFG.end_year+1))
+train_df = df[~df["year"].isin(TEST_YEARS)].copy()
+test_df  = df[df["year"].isin(TEST_YEARS)].copy()
+
+FEATURES = [
+    "temp_c","precip_mm","wind_ms","vpd_kpa","heatwave_days","co2_ppm",
+    "soil_om_pct","soil_cation_meq","fert_kg_ha","irrigated","variety_score",
+    "ndvi","evi","lst_c","soil_moisture","lat","lon","elev_m"
+]
+TARGET = "yield_t_ha"
+
+Xtr, ytr = train_df[FEATURES].values, train_df[TARGET].values
+Xte, yte = test_df[FEATURES].values, test_df[TARGET].values
+
+# -----------------------------
+# 3) Fit models
+# -----------------------------
+rf = RandomForestRegressor(n_estimators=500, random_state=42, n_jobs=-1)
+gbr = GradientBoostingRegressor(random_state=42)
+
+rf.fit(Xtr, ytr)
+gbr.fit(Xtr, ytr)
+
+def eval_model(name, model, Xte, yte):
+    yp = model.predict(Xte)
+    mae = mean_absolute_error(yte, yp)
+    rmse = mean_squared_error(yte, yp, squared=False)
+    r2 = r2_score(yte, yp)
+    print(f"{name:>6} | MAE={mae:.3f}  RMSE={rmse:.3f}  R2={r2:.3f}")
+    return yp, {"MAE": mae, "RMSE": rmse, "R2": r2}
+
+yp_rf, m_rf = eval_model("RF", rf, Xte, yte)
+yp_gb, m_gb = eval_model("GBR", gbr, Xte, yte)
+
+# Cross-val (time series splits) on training set
+tscv = TimeSeriesSplit(n_splits=5)
+cv_rf = cross_val_score(rf, train_df[FEATURES], ytr, cv=tscv, scoring="r2")
+cv_gb = cross_val_score(gbr, train_df[FEATURES], ytr, cv=tscv, scoring="r2")
+print(f"RF  CV R2 mean={cv_rf.mean():.3f} ± {cv_rf.std():.3f}")
+print(f"GBR CV R2 mean={cv_gb.mean():.3f} ± {cv_gb.std():.3f}")
+
+# -----------------------------
+# 4) Plots
+# -----------------------------
+def parity_plot(y_true, y_pred, title, path):
+    plt.figure()
+    plt.scatter(y_true, y_pred, alpha=0.5)
+    mn, mx = min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())
+    plt.plot([mn, mx], [mn, mx])
+    plt.xlabel("True yield (t/ha)")
+    plt.ylabel("Predicted yield (t/ha)")
+    plt.title(title)
+    plt.tight_layout(); plt.savefig(path); plt.close()
+
+parity_plot(yte, yp_rf, "Parity: RandomForest (test)", OUT / "parity_rf.png")
+parity_plot(yte, yp_gb, "Parity: GradientBoosting (test)", OUT / "parity_gbr.png")
+
+# Feature importances (RF)
+imp = pd.Series(rf.feature_importances_, index=FEATURES).sort_values()
+plt.figure()
+plt.barh(imp.index, imp.values)
+plt.title("RF Feature Importance")
+plt.tight_layout(); plt.savefig(OUT / "feature_importance_rf.png"); plt.close()
+
+# -----------------------------
+# 5) Climate change scenario analysis
+# -----------------------------
+def apply_scenario(df_in: pd.DataFrame, dtemp=+2.0, prcp_mult=0.9, dco2=+30):
+    df_s = df_in.copy()
+    df_s["temp_c"]     = df_s["temp_c"] + dtemp
+    df_s["precip_mm"]  = df_s["precip_mm"] * prcp_mult
+    df_s["co2_ppm"]    = df_s["co2_ppm"] + dco2
+    # secondary effects: more heatwaves, higher VPD, higher LST, lower soil moisture & indices
+    df_s["heatwave_days"] = df_s["heatwave_days"] * (1 + 0.35) + 4
+    df_s["vpd_kpa"]       = df_s["vpd_kpa"] + 0.35
+    df_s["lst_c"]         = df_s["lst_c"] + dtemp
+    df_s["soil_moisture"] = np.clip(df_s["soil_moisture"] - 0.04, 0.02, 1.0)
+    df_s["ndvi"]          = np.clip(df_s["ndvi"] - 0.05, 0.05, 0.95)
+    df_s["evi"]           = np.clip(df_s["evi"] - 0.04, 0.05, 0.95)
+    return df_s
+
+scenario = apply_scenario(test_df, dtemp=+2.0, prcp_mult=0.9, dco2=+30)
+Xsc = scenario[FEATURES].values
+yp_rf_sc = rf.predict(Xsc)
+
+delta = pd.DataFrame({
+    "region": test_df["region"].values,
+    "year": test_df["year"].values,
+    "baseline_pred_t_ha": yp_rf,
+    "scenario_pred_t_ha": yp_rf_sc,
+    "delta_t_ha": yp_rf_sc - yp_rf,
+    "delta_pct": (yp_rf_sc - yp_rf) / np.maximum(0.1, yp_rf) * 100
+})
+delta.to_csv(OUT / "scenario_delta.csv", index=False)
+
+print("\nScenario (+2°C, -10% rain, +30ppm CO2) using RF on test set:")
+print(delta[["delta_t_ha", "delta_pct"]].describe().round(3))
+
+plt.figure()
+plt.hist(delta["delta_t_ha"], bins=30)
+plt.title("Yield change (t/ha) under scenario")
+plt.xlabel("Δ yield (t/ha)"); plt.ylabel("Count")
+plt.tight_layout(); plt.savefig(OUT / "scenario_hist_delta_t_ha.png"); plt.close()
+
+# -----------------------------
+# 6) Save models & metadata
+# -----------------------------
+dump(rf, OUT / "yield_rf.joblib")
+dump(gbr, OUT / "yield_gbr.joblib")
+with open(OUT / "README_AgYieldDemo.txt", "w") as f:
+    f.write(
+        "Agricultural-Yield-Forecasting-under-Climate-Change (Synthetic Demo)\n"
+        f"Crop: {CFG.crop}\n"
+        f"Train years: {CFG.start_year}-{max(df['year'])-2} | Test years: {TEST_YEARS}\n"
+        "Models: RandomForestRegressor, GradientBoostingRegressor\n"
+        "Scenario: +2°C, -10% precipitation, +30 ppm CO2\n"
+    )
+
+print(f"\nArtifacts saved to: {OUT.resolve()}")
